@@ -54,7 +54,7 @@ curl -s http://<host>:10001/loadbalancers | jq
     "uuid": "087fcb0f-8e07-4123-a32f-e8e83a281023",
     "name": "test loadbalancer",
     "eip": "147.75.84.41",
-    "port": 0,
+    "port": 6443,
     "backends": null
   }
 ]
