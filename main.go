@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +32,6 @@ import (
 // curl -X POST http://code:10001/loadbalancer/uuid/backend -H 'Content-Type: application/json' -d '{"ip":"1.1.1.1", "port": "6443"}'
 
 // curl -X POST http://code:10001/loadbalancer/02b5d4d9-f40b-47a1-aa74-91631732bab1/backend -H 'Content-Type: application/json' -d '{"ip":"1.1.1.1", "port": "6443"}'
-
 
 var projectID, facility string
 var bgpConfig *BGPConfig
@@ -588,14 +588,48 @@ func (lb *IPVSLoadBalancer) RemoveBackend(address string) error {
 	return nil
 }
 
+func configureNetwork() error {
+
+	ipfw_file, err := os.OpenFile("/proc/sys/net/ipv4/ip_forward", os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open ip_forward file")
+	}
+	defer ipfw_file.Close()
+	_, err = ipfw_file.WriteString("1")
+	if err != nil {
+		return fmt.Errorf("failed to write: %v", err)
+	}
+
+	ipfw_conntrack, err := os.OpenFile("/proc/sys/net/ipv4/vs/conntrack", os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open conntrack file")
+	}
+	defer ipfw_conntrack.Close()
+	_, err = ipfw_conntrack.WriteString("1")
+	if err != nil {
+		return fmt.Errorf("failed to write: %v", err)
+	}
+
+	if _, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "bond0", "-j", "MASQUERADE").CombinedOutput(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func main() {
 	projectID = os.Getenv("PROJECT_ID")
 	facility = os.Getenv("FACILITY_ID")
 
 	log.Infoln("Starting Equinix Metal - Vippy LoadBalancer")
 	var err error
-	log.Infoln("Creating Equinix Metal Client")
+	log.Infoln("Connecting to Equinix Metal API")
 	emClient, err = packngo.NewClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Info("Configuring kernel for forwarding and masquerading of packets")
+	err = configureNetwork()
 	if err != nil {
 		log.Fatal(err)
 	}
