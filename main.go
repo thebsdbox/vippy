@@ -5,26 +5,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/cloudflare/ipvs"
+	"golang.org/x/sys/unix"
+
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	api "github.com/osrg/gobgp/api"
 	gobgp "github.com/osrg/gobgp/pkg/server"
 	"github.com/packethost/packngo"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 )
 
-// curl -X POST http://code:10001/loadbalancer -H 'Content-Type: application/json' -d '{"name":"test loadbalancer"}'
-// curl -X POST http://code:10001/loadbalancer/uuid/backend -H 'Content-Type: application/json' -d '{"ip":"1.1.1.1", port: "6443"}'
+// curl -X POST http://code:10001/loadbalancer -H 'Content-Type: application/json' -d '{"name":"test loadbalancer", "port": "6443"}'
+// curl -X POST http://code:10001/loadbalancer/uuid/backend -H 'Content-Type: application/json' -d '{"ip":"1.1.1.1", "port": "6443"}'
 
 // curl -X POST http://code:10001/loadbalancer/02b5d4d9-f40b-47a1-aa74-91631732bab1/backend -H 'Content-Type: application/json' -d '{"ip":"1.1.1.1", "port": "6443"}'
 
-var projectID string
-var bgpConfig BGPConfig
+
+var projectID, facility string
+var bgpConfig *BGPConfig
 var emClient *packngo.Client
 
 type BGPConfig struct {
@@ -49,16 +59,20 @@ type Config struct {
 }
 
 type LoadBalancer struct {
-	UUID    string     `json:"uuid"`
-	Name    string     `json:"name"`
-	EIP     string     `json:"eip"`
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
+
+	EIP  string `json:"eip"`
+	Port int    `json:"port"`
+
+	ipvs    *IPVSLoadBalancer
 	Backend []Backends `json:"backends"`
 }
 
 type Backends struct {
 	UUID string `json:"uuid"`
 	IP   string `json:"ip"`
-	Port string `json:"port"`
+	Port int    `json:"port"`
 }
 
 var LoadBalancers []LoadBalancer
@@ -73,6 +87,7 @@ func handleRequests() {
 	myRouter.HandleFunc("/loadbalancer/{uuid}", returnSingleLoadBalancer).Methods("GET")
 	myRouter.HandleFunc("/loadbalancer/{uuid}", deleteLoadBalancer).Methods("DELETE")
 	myRouter.HandleFunc("/loadbalancer/{uuid}/backend", createNewBackend).Methods("POST")
+	myRouter.HandleFunc("/loadbalancer/{uuid}/backend/{backenduuid}", deleteLoadBalancer).Methods("DELETE")
 
 	myRouter.HandleFunc("/", homePage)
 
@@ -96,13 +111,24 @@ func createNewLoadBalancer(w http.ResponseWriter, r *http.Request) {
 	} else {
 		loadbalancer.EIP = *ip
 	}
+	err = AddIP(loadbalancer.EIP)
+	if err != nil {
+		log.Error(err)
+	}
+	// Do load Balancer magic
+	err = bgpConfig.AddHost(fmt.Sprintf("%s/32", loadbalancer.EIP))
+	if err != nil {
+		log.Error(err)
+	}
+	loadbalancer.ipvs, err = NewIPVSLB(loadbalancer.EIP, loadbalancer.Port)
+	if err != nil {
+		log.Error(err)
+	}
 	LoadBalancers = append(LoadBalancers, loadbalancer)
-
-	json.NewEncoder(w).Encode(loadbalancer)
+	log.Infof("Created new Loadbalancer IP [%s] UUID [%s]", loadbalancer.EIP, loadbalancer.UUID)
 }
 
 func returnAllLoadBalancers(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Endpoint Hit: returnAllArticles")
 	json.NewEncoder(w).Encode(LoadBalancers)
 }
 
@@ -110,9 +136,6 @@ func returnSingleLoadBalancer(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["uuid"]
 
-	// Loop over all of our Articles
-	// if the article.Id equals the key we pass in
-	// return the article encoded as JSON
 	for _, loadbalancer := range LoadBalancers {
 		if loadbalancer.UUID == key {
 			json.NewEncoder(w).Encode(loadbalancer)
@@ -124,13 +147,10 @@ func createNewBackend(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["uuid"]
 
-	// Loop over all of our Articles
-	// if the article.Id equals the key we pass in
-	// return the article encoded as JSON
 	for i, loadbalancer := range LoadBalancers {
 		if loadbalancer.UUID == key {
 			reqBody, _ := ioutil.ReadAll(r.Body)
-			fmt.Printf(string(reqBody))
+			fmt.Println(string(reqBody))
 			var backend Backends
 			backend.UUID = uuid.NewString()
 			err := json.Unmarshal(reqBody, &backend)
@@ -138,7 +158,31 @@ func createNewBackend(w http.ResponseWriter, r *http.Request) {
 				log.Error(err)
 			}
 			LoadBalancers[i].Backend = append(loadbalancer.Backend, backend)
-			json.NewEncoder(w).Encode(LoadBalancers[i])
+			loadbalancer.ipvs.AddBackend(backend.IP, backend.Port)
+			log.Infof("Created new backend for IP [%s] w/IP [%s] UUID [%s]", loadbalancer.EIP, backend.IP, backend.UUID)
+		}
+	}
+}
+
+func deleteBackend(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	key := vars["uuid"]
+	backendKey := vars["backenduui"]
+
+	// Loop over all of our Articles
+	// if the article.Id equals the key we pass in
+	// return the article encoded as JSON
+	for _, loadbalancer := range LoadBalancers {
+		if loadbalancer.UUID == key {
+			for i, backend := range loadbalancer.Backend {
+				if backend.UUID == backendKey {
+					loadbalancer.ipvs.RemoveBackend(backend.IP)
+					loadbalancer.Backend = append(loadbalancer.Backend[:i], loadbalancer.Backend[i+1:]...)
+
+				}
+
+			}
+
 		}
 	}
 }
@@ -151,6 +195,18 @@ func deleteLoadBalancer(w http.ResponseWriter, r *http.Request) {
 		if loadbalancer.UUID == key {
 			// Delete teh load balancer from teh API
 			err := delanIP(projectID, loadbalancer.EIP)
+			if err != nil {
+				log.Error(err)
+			}
+			err = loadbalancer.ipvs.RemoveIPVSLB()
+			if err != nil {
+				log.Error(err)
+			}
+			err = DeleteIP(loadbalancer.EIP)
+			if err != nil {
+				log.Error(err)
+			}
+			err = bgpConfig.DelHost(fmt.Sprintf("%s/32", loadbalancer.EIP))
 			if err != nil {
 				log.Error(err)
 			}
@@ -209,29 +265,37 @@ func findSelf(projectID string) *packngo.Device {
 	return nil
 }
 
-func startBGP() (*Server, error) {
+func startBGP() (*BGPConfig, error) {
+	var b Config
 	thisDevice := findSelf(projectID)
 	if thisDevice == nil {
-		log.Fatalf("Unable to find correct device")
+		log.Fatalf("Unable to find device/server in Equinix Metal")
 	}
 
-	fmt.Printf("Querying BGP settings for [%s]", thisDevice.Hostname)
-	neighbours, _, _ := emClient.Devices.ListBGPNeighbors(thisDevice.ID, &packngo.ListOptions{})
+	log.Infof("Querying BGP settings for [%s]\n", thisDevice.Hostname)
+	neighbours, _, err := emClient.Devices.ListBGPNeighbors(thisDevice.ID, &packngo.ListOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(neighbours) == 0 {
+		log.Fatalf("There are no neighbours being advertised, ensure BGP is enabled for this device")
+	}
 	if len(neighbours) > 1 {
 		log.Fatalf("There are [%s] neighbours, only designed to manage one", len(neighbours))
 	}
+	b.RouterID = neighbours[0].CustomerIP
+	b.AS = uint32(neighbours[0].CustomerAs)
 
-	bgpCfg := &Config{
-		RouterID: neighbours[0].CustomerIP,
-		AS:       uint32(neighbours[0].CustomerAs),
-	}
-	p := &Peer{
-		Address: neighbours[0].PeerIps[0],
-		AS:      uint32(neighbours[0].PeerAs),
+	// Add the peer(s)
+	for x := range neighbours[0].PeerIps {
+		peer := Peer{
+			Address: neighbours[0].PeerIps[x],
+			AS:      uint32(neighbours[0].PeerAs),
+		}
+		b.Peers = append(b.Peers, peer)
 	}
 
-	bgpCfg.Peers = append(bgpCfg.Peers, *p)
-	s, err := NewBgp(bgpCfg)
+	s, err := NewBgp(&b)
 
 	if err != nil {
 		log.Fatal(err)
@@ -252,7 +316,7 @@ func NewBgp(c *Config) (b *BGPConfig, err error) {
 		return nil, fmt.Errorf("You need to provide at least one peer")
 	}
 
-	b = &Server{
+	b = &BGPConfig{
 		s: gobgp.NewBgpServer(),
 		c: c,
 	}
@@ -280,7 +344,7 @@ func NewBgp(c *Config) (b *BGPConfig, err error) {
 
 	return
 }
-func (b *Server) AddPeer(peer Peer) (err error) {
+func (b *BGPConfig) AddPeer(peer Peer) (err error) {
 	port := 179
 
 	if t := strings.SplitN(peer.Address, ":", 2); len(t) == 2 {
@@ -313,13 +377,221 @@ func (b *Server) AddPeer(peer Peer) (err error) {
 	if b.c.SourceIP != "" {
 		p.Transport.LocalAddress = b.c.SourceIP
 	}
+	if b.c.SourceIF != "" {
+		p.Transport.BindInterface = b.c.SourceIF
+	}
 
 	return b.s.AddPeer(context.Background(), &api.AddPeerRequest{
 		Peer: p,
 	})
 }
+
+func (b *BGPConfig) getPath(ip net.IP) *api.Path {
+	var pfxLen uint32 = 32
+	if ip.To4() == nil {
+		if !b.c.IPv6 {
+			return nil
+		}
+
+		pfxLen = 128
+	}
+
+	nlri, _ := ptypes.MarshalAny(&api.IPAddressPrefix{
+		Prefix:    ip.String(),
+		PrefixLen: pfxLen,
+	})
+
+	a1, _ := ptypes.MarshalAny(&api.OriginAttribute{
+		Origin: 0,
+	})
+
+	var nh string
+	if b.c.NextHop != "" {
+		nh = b.c.NextHop
+	} else if b.c.SourceIP != "" {
+		nh = b.c.SourceIP
+	} else {
+		nh = b.c.RouterID
+	}
+
+	a2, _ := ptypes.MarshalAny(&api.NextHopAttribute{
+		NextHop: nh,
+	})
+
+	return &api.Path{
+		Family: &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		},
+		Nlri:   nlri,
+		Pattrs: []*any.Any{a1, a2},
+	}
+}
+
+func (b *BGPConfig) AddHost(addr string) (err error) {
+	ip, _, err := net.ParseCIDR(addr)
+	if err != nil {
+		return err
+	}
+	p := b.getPath(ip)
+	if p == nil {
+		return
+	}
+
+	_, err = b.s.AddPath(context.Background(), &api.AddPathRequest{
+		Path: p,
+	})
+
+	return
+}
+
+func (b *BGPConfig) DelHost(addr string) (err error) {
+	ip, _, err := net.ParseCIDR(addr)
+	if err != nil {
+		return err
+	}
+	p := b.getPath(ip)
+	if p == nil {
+		return
+	}
+
+	return b.s.DeletePath(context.Background(), &api.DeletePathRequest{
+		Path: p,
+	})
+}
+
+func (b *BGPConfig) Close() error {
+	ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cf()
+	return b.s.StopBgp(ctx, &api.StopBgpRequest{})
+}
+
+// AddIP - Add an IP address to the interface
+func AddIP(ip string) error {
+	link, err := netlink.LinkByName("lo")
+	if err != nil {
+		return err
+	}
+
+	address, err := netlink.ParseAddr(ip + "/32")
+	address.Scope = unix.RT_SCOPE_HOST
+	if err := netlink.AddrReplace(link, address); err != nil {
+		return errors.Wrap(err, "could not add ip")
+	}
+	return nil
+}
+
+// DeleteIP - Remove an IP address from the interface
+func DeleteIP(ip string) error {
+	link, err := netlink.LinkByName("lo")
+	if err != nil {
+		return err
+	}
+
+	address, err := netlink.ParseAddr(ip + "/32")
+	if err = netlink.AddrDel(link, address); err != nil {
+		return errors.Wrap(err, "could not delete ip")
+	}
+
+	return nil
+}
+
+const (
+	ROUNDROBIN = "rr"
+)
+
+type IPVSLoadBalancer struct {
+	client              ipvs.Client
+	loadBalancerService ipvs.Service
+	Port                int
+}
+
+func NewIPVSLB(address string, port int) (*IPVSLoadBalancer, error) {
+
+	// Create IPVS client
+	c, err := ipvs.New()
+	if err != nil {
+		return nil, fmt.Errorf("error creating IPVS client: %v", err)
+	}
+
+	// Generate out API Server LoadBalancer instance
+	svc := ipvs.Service{
+		Family:    ipvs.INET,
+		Protocol:  ipvs.TCP,
+		Port:      uint16(port),
+		Address:   ipvs.NewIP(net.ParseIP(address)),
+		Scheduler: ROUNDROBIN,
+	}
+	err = c.CreateService(svc)
+	// If we've an error it could be that the IPVS lb instance has been left from a previous leadership
+	if err != nil && strings.Contains(err.Error(), "file exists") {
+		log.Warnf("load balancer for API server already exists, attempting to remove and re-create")
+		err = c.RemoveService(svc)
+		if err != nil {
+			return nil, fmt.Errorf("error re-creating IPVS service: %v", err)
+		}
+		err = c.CreateService(svc)
+		if err != nil {
+			return nil, fmt.Errorf("error re-creating IPVS service: %v", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("error creating IPVS service: %v", err)
+	}
+
+	lb := &IPVSLoadBalancer{
+		Port:                port,
+		client:              c,
+		loadBalancerService: svc,
+	}
+	// Return our created load-balancer
+	return lb, nil
+}
+
+func (lb *IPVSLoadBalancer) RemoveIPVSLB() error {
+	err := lb.client.RemoveService(lb.loadBalancerService)
+	if err != nil {
+		return fmt.Errorf("error removing existing IPVS service: %v", err)
+	}
+	return nil
+
+}
+
+func (lb *IPVSLoadBalancer) AddBackend(address string, port int) error {
+	dst := ipvs.Destination{
+		Address:   ipvs.NewIP(net.ParseIP(address)),
+		Port:      uint16(port),
+		Family:    ipvs.INET,
+		Weight:    1,
+		FwdMethod: ipvs.Masquarade,
+	}
+
+	err := lb.client.CreateDestination(lb.loadBalancerService, dst)
+	// Swallow error of existing back end, the node watcher may attempt to apply
+	// the same back end multiple times
+	if err != nil && !strings.Contains(err.Error(), "file exists") {
+		return fmt.Errorf("error creating backend: %v", err)
+	}
+	return nil
+}
+
+func (lb *IPVSLoadBalancer) RemoveBackend(address string) error {
+	dst := ipvs.Destination{
+		Address: ipvs.NewIP(net.ParseIP(address)),
+		Port:    6443,
+		Family:  ipvs.INET,
+		Weight:  1,
+	}
+	err := lb.client.RemoveDestination(lb.loadBalancerService, dst)
+	if err != nil {
+		return fmt.Errorf("error removing backend: %v", err)
+	}
+	return nil
+}
+
 func main() {
-	projectID = os.Getenv("PROJ_ID")
+	projectID = os.Getenv("PROJECT_ID")
+	facility = os.Getenv("FACILITY_ID")
+
 	log.Infoln("Starting Equinix Metal - Vippy LoadBalancer")
 	var err error
 	log.Infoln("Creating Equinix Metal Client")
@@ -328,6 +600,11 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Infoln("Creating BGP")
-	bgpServer, err = BGPClient()
+	bgpConfig, err = startBGP()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Infoln("API Server is now listening on :10001")
+
 	handleRequests()
 }
